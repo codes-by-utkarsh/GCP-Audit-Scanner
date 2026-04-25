@@ -476,7 +476,7 @@ run_cmd \
 bash -c \
 "gcloud run services list \
 --platform managed \
---format='value(metadata.name,metadata.labels.cloud.googleapis.com/location)' \
+--format='value(name,region)' \
 > '$BASE_DIR/cloudrun/services_with_regions.txt'"
 
 # =====================================================================================
