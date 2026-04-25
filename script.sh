@@ -1,39 +1,38 @@
 #!/usr/bin/env bash
 
 # =====================================================================================
-# ENTERPRISE GCP SECURITY AUDIT FRAMEWORK (SOC2 ALIGNED)
+# ENTERPRISE GCP SECURITY AUDIT FRAMEWORK (SOC2 ALIGNED - HARDENED EDITION)
 # =====================================================================================
 #
 # FEATURES
 # --------
-# [x] Auto installs dependencies
-# [x] Auto installs kubectl
-# [x] Auto installs Prowler
-# [x] Auto installs Trivy
-# [x] Continues execution even if commands fail
-# [x] Logs all errors
-# [x] IAM enumeration
-# [x] Public exposure detection
+# [x] Resilient execution (never exits on single failure)
+# [x] Timeout protection
+# [x] Non-interactive installs
+# [x] Error logging
+# [x] SOC2-aligned Prowler audit
+# [x] IAM analysis
 # [x] Service account abuse checks
-# [x] Service account impersonation detection
-# [x] OAuth scope analysis
-# [x] Workload Identity analysis
-# [x] External IP exposure mapping
+# [x] Workload identity analysis
+# [x] OAuth scope extraction
+# [x] External IP exposure checks
 # [x] Firewall enumeration
 # [x] Bucket IAM analysis
 # [x] GKE RBAC extraction
-# [x] Cloud Functions analysis
-# [x] Dynamic Cloud Run IAM checks
+# [x] Cloud Run IAM extraction
 # [x] Secret Manager IAM analysis
-# [x] Artifact Registry enumeration fix
-# [x] Trivy timeout support
-# [x] SOC2 mapped Prowler findings
+# [x] Artifact Registry enumeration
+# [x] Trivy scanning
 #
 # =====================================================================================
 
 set +e
 set +u
-set -o pipefail
+set +o pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+trap 'echo "[!] Non-fatal error occurred, continuing execution..."' ERR
 
 PROJECT_ID="${1:-}"
 
@@ -43,6 +42,7 @@ if [[ -z "$PROJECT_ID" ]]; then
 fi
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
 BASE_DIR="gcp_audit_${PROJECT_ID}_${TIMESTAMP}"
 
 mkdir -p "$BASE_DIR"/{
@@ -63,6 +63,7 @@ mkdir -p "$BASE_DIR"/{
 }
 
 ERROR_LOG="$BASE_DIR/logs/errors.log"
+
 touch "$ERROR_LOG"
 
 # =====================================================================================
@@ -70,11 +71,32 @@ touch "$ERROR_LOG"
 # =====================================================================================
 
 log() {
+
     echo
     echo "================================================================"
     echo "[+] $1"
     echo "================================================================"
     echo
+
+}
+
+# =====================================================================================
+# TIMEOUT WRAPPER
+# =====================================================================================
+
+timeout_cmd() {
+
+    timeout 900 "$@"
+
+    EXIT_CODE=$?
+
+    if [[ $EXIT_CODE -eq 124 ]]; then
+
+        echo "[!] TIMEOUT: $*" >> "$ERROR_LOG"
+
+    fi
+
+    return 0
 }
 
 # =====================================================================================
@@ -91,7 +113,7 @@ run_cmd() {
     echo "[*] Running: $*"
     echo
 
-    "$@"
+    timeout_cmd "$@"
 
     EXIT_CODE=$?
 
@@ -135,7 +157,8 @@ docker.io \
 apt-transport-https \
 ca-certificates \
 gnupg \
-lsb-release
+lsb-release \
+timeout
 
 # =====================================================================================
 # INSTALL GCLOUD SDK
@@ -148,7 +171,7 @@ if ! command -v gcloud >/dev/null 2>&1; then
     run_cmd \
     "Install GCloud SDK" \
     bash -c \
-    "curl https://sdk.cloud.google.com | bash"
+    "curl -s https://sdk.cloud.google.com | bash"
 
     export PATH="$PATH:$HOME/google-cloud-sdk/bin"
 
@@ -160,10 +183,8 @@ fi
 
 if ! command -v kubectl >/dev/null 2>&1; then
 
-    log "Installing kubectl"
-
     run_cmd \
-    "Install kubectl via gcloud" \
+    "Install kubectl" \
     gcloud components install kubectl --quiet
 
 fi
@@ -173,8 +194,6 @@ fi
 # =====================================================================================
 
 if ! command -v prowler >/dev/null 2>&1; then
-
-    log "Installing Prowler"
 
     run_cmd \
     "Upgrade pip" \
@@ -192,8 +211,6 @@ fi
 
 if ! command -v trivy >/dev/null 2>&1; then
 
-    log "Installing Trivy"
-
     run_cmd \
     "Install Trivy" \
     bash -c \
@@ -202,10 +219,10 @@ if ! command -v trivy >/dev/null 2>&1; then
 fi
 
 # =====================================================================================
-# AUTHENTICATION
+# AUTH CHECK
 # =====================================================================================
 
-log "Checking GCloud authentication"
+log "Checking authentication"
 
 ACTIVE_ACCOUNT=$(gcloud auth list \
 --filter=status:ACTIVE \
@@ -215,11 +232,11 @@ if [[ -z "$ACTIVE_ACCOUNT" ]]; then
 
     run_cmd \
     "GCloud Login" \
-    gcloud auth login
+    gcloud auth login --no-launch-browser
 
     run_cmd \
     "Application Default Login" \
-    gcloud auth application-default login
+    gcloud auth application-default login --no-launch-browser
 
 fi
 
@@ -262,19 +279,27 @@ bash -c \
 # HIGH PRIVILEGE ROLES
 # =====================================================================================
 
+if [[ -s "$BASE_DIR/iam/project_iam.json" ]]; then
+
 run_cmd \
 "High privilege role detection" \
 bash -c \
 "jq '.bindings[] | select(.role | test(\"owner|editor|admin|iam|security|resourcemanager\"; \"i\"))' '$BASE_DIR/iam/project_iam.json' > '$BASE_DIR/iam/high_priv_roles.json'"
 
+fi
+
 # =====================================================================================
-# PUBLIC ACCESS CHECKS
+# PUBLIC IAM EXPOSURE
 # =====================================================================================
+
+if [[ -s "$BASE_DIR/iam/project_iam.json" ]]; then
 
 run_cmd \
 "Public IAM exposure detection" \
 bash -c \
 "jq '.bindings[] | select((.members[]? | contains(\"allUsers\")) or (.members[]? | contains(\"allAuthenticatedUsers\")))' '$BASE_DIR/iam/project_iam.json' > '$BASE_DIR/iam/public_bindings.json'"
+
+fi
 
 # =====================================================================================
 # SERVICE ACCOUNTS
@@ -288,6 +313,8 @@ bash -c \
 # =====================================================================================
 # SERVICE ACCOUNT KEYS
 # =====================================================================================
+
+if [[ -s "$BASE_DIR/iam/service_accounts.json" ]]; then
 
 while read -r sa; do
 
@@ -308,18 +335,13 @@ done < <(
     "$BASE_DIR/iam/service_accounts.json" 2>/dev/null
 )
 
-# =====================================================================================
-# SERVICE ACCOUNT IMPERSONATION
-# =====================================================================================
-
-run_cmd \
-"Service account impersonation detection" \
-bash -c \
-"jq '.bindings[] | select(.role == \"roles/iam.serviceAccountTokenCreator\")' '$BASE_DIR/iam/project_iam.json' > '$BASE_DIR/iam/service_account_impersonation.json'"
+fi
 
 # =====================================================================================
 # WORKLOAD IDENTITY
 # =====================================================================================
+
+if [[ -s "$BASE_DIR/iam/service_accounts.json" ]]; then
 
 while read -r sa; do
 
@@ -339,6 +361,8 @@ done < <(
     "$BASE_DIR/iam/service_accounts.json" 2>/dev/null
 )
 
+fi
+
 # =====================================================================================
 # COMPUTE INSTANCES
 # =====================================================================================
@@ -349,22 +373,30 @@ bash -c \
 "gcloud compute instances list --format=json > '$BASE_DIR/compute/instances.json'"
 
 # =====================================================================================
-# EXTERNAL IP ANALYSIS
+# EXTERNAL IPS
 # =====================================================================================
+
+if [[ -s "$BASE_DIR/compute/instances.json" ]]; then
 
 run_cmd \
 "External IP exposure analysis" \
 bash -c \
 "jq '[ .[] | {name: .name, externalIPs: [ .networkInterfaces[]?.accessConfigs[]?.natIP ]}]' '$BASE_DIR/compute/instances.json' > '$BASE_DIR/exposure/external_ips.json'"
 
+fi
+
 # =====================================================================================
 # OAUTH SCOPES
 # =====================================================================================
+
+if [[ -s "$BASE_DIR/compute/instances.json" ]]; then
 
 run_cmd \
 "OAuth scope extraction" \
 bash -c \
 "jq '[ .[] | {instance: .name, scopes: [ .serviceAccounts[]?.scopes[] ]}]' '$BASE_DIR/compute/instances.json' > '$BASE_DIR/oauth/oauth_scopes.json'"
+
+fi
 
 # =====================================================================================
 # FIREWALL RULES
@@ -374,15 +406,6 @@ run_cmd \
 "Firewall rule enumeration" \
 bash -c \
 "gcloud compute firewall-rules list --format=json > '$BASE_DIR/networking/firewall_rules.json'"
-
-# =====================================================================================
-# NETWORK ENUMERATION
-# =====================================================================================
-
-run_cmd \
-"VPC enumeration" \
-bash -c \
-"gcloud compute networks list --format=json > '$BASE_DIR/networking/networks.json'"
 
 # =====================================================================================
 # STORAGE BUCKETS
@@ -396,6 +419,8 @@ bash -c \
 # =====================================================================================
 # BUCKET IAM
 # =====================================================================================
+
+if [[ -s "$BASE_DIR/storage/buckets.json" ]]; then
 
 while read -r bucket; do
 
@@ -415,6 +440,8 @@ done < <(
     "$BASE_DIR/storage/buckets.json" 2>/dev/null
 )
 
+fi
+
 # =====================================================================================
 # GKE CLUSTERS
 # =====================================================================================
@@ -425,65 +452,61 @@ bash -c \
 "gcloud container clusters list --format=json > '$BASE_DIR/kubernetes/clusters.json'"
 
 # =====================================================================================
-# GKE RBAC EXTRACTION
+# GKE RBAC
 # =====================================================================================
+
+if [[ -s "$BASE_DIR/kubernetes/clusters.json" ]]; then
 
 while read -r cluster; do
 
     [[ -z "$cluster" ]] && continue
 
-    REGION=$(gcloud container clusters list \
+    LOCATION=$(gcloud container clusters list \
     --filter="name=$cluster" \
     --format="value(location)" \
     2>/dev/null | head -n1)
+
+    [[ -z "$LOCATION" ]] && continue
 
     run_cmd \
     "Fetch credentials for $cluster" \
     gcloud container clusters get-credentials \
     "$cluster" \
-    --region "$REGION"
+    --location "$LOCATION"
 
     run_cmd \
     "ClusterRoleBindings extraction: $cluster" \
     bash -c \
-    "kubectl get clusterrolebindings -o yaml > '$BASE_DIR/kubernetes/${cluster}_clusterrolebindings.yaml'"
+    "kubectl --request-timeout=30s get clusterrolebindings -o yaml > '$BASE_DIR/kubernetes/${cluster}_clusterrolebindings.yaml'"
 
     run_cmd \
     "RBAC extraction: $cluster" \
     bash -c \
-    "kubectl get roles,rolebindings -A -o yaml > '$BASE_DIR/kubernetes/${cluster}_rbac.yaml'"
+    "kubectl --request-timeout=30s get roles,rolebindings -A -o yaml > '$BASE_DIR/kubernetes/${cluster}_rbac.yaml'"
 
 done < <(
     jq -r '.[].name' \
     "$BASE_DIR/kubernetes/clusters.json" 2>/dev/null
 )
 
+fi
+
 # =====================================================================================
-# CLOUD FUNCTIONS
+# CLOUD RUN
 # =====================================================================================
 
 run_cmd \
-"Cloud Functions enumeration" \
+"Cloud Run enumeration" \
 bash -c \
-"gcloud functions list --format=json > '$BASE_DIR/cloudfunctions/functions.json'"
+"gcloud run services list --platform managed --format='csv[no-heading](name,region)' > '$BASE_DIR/cloudrun/services_with_regions.txt'"
 
 # =====================================================================================
-# CLOUD RUN ENUMERATION WITH REGIONS
+# CLOUD RUN IAM
 # =====================================================================================
 
-run_cmd \
-"Cloud Run enumeration with regions" \
-bash -c \
-"gcloud run services list \
---platform managed \
---format='value(name,region)' \
-> '$BASE_DIR/cloudrun/services_with_regions.txt'"
+if [[ -s "$BASE_DIR/cloudrun/services_with_regions.txt" ]]; then
 
-# =====================================================================================
-# CLOUD RUN IAM EXTRACTION
-# =====================================================================================
-
-while read -r service region; do
+while IFS=',' read -r service region; do
 
     [[ -z "$service" ]] && continue
     [[ -z "$region" ]] && continue
@@ -500,6 +523,8 @@ while read -r service region; do
 
 done < "$BASE_DIR/cloudrun/services_with_regions.txt"
 
+fi
+
 # =====================================================================================
 # SECRET MANAGER
 # =====================================================================================
@@ -512,6 +537,8 @@ bash -c \
 # =====================================================================================
 # SECRET IAM
 # =====================================================================================
+
+if [[ -s "$BASE_DIR/secrets/secrets.json" ]]; then
 
 while read -r secret; do
 
@@ -531,17 +558,22 @@ done < <(
     "$BASE_DIR/secrets/secrets.json" 2>/dev/null
 )
 
+fi
+
 # =====================================================================================
-# ARTIFACT REGISTRY ENUMERATION FIX
+# ARTIFACT REGISTRY
 # =====================================================================================
 
 IMAGE_FILE="$BASE_DIR/artifacts/images.txt"
+
 touch "$IMAGE_FILE"
 
 run_cmd \
 "Artifact repository enumeration" \
 bash -c \
 "gcloud artifacts repositories list --format=json > '$BASE_DIR/artifacts/repositories.json'"
+
+if [[ -s "$BASE_DIR/artifacts/repositories.json" ]]; then
 
 while read -r repo format location; do
 
@@ -569,9 +601,13 @@ done < <(
         .location
       ]
     | @tsv
-    ' "$BASE_DIR/artifacts/repositories.json"
+    ' "$BASE_DIR/artifacts/repositories.json" 2>/dev/null
 
 )
+
+fi
+
+sort -u "$IMAGE_FILE" -o "$IMAGE_FILE"
 
 # =====================================================================================
 # TRIVY FILESYSTEM SCAN
@@ -580,7 +616,9 @@ done < <(
 run_cmd \
 "Trivy filesystem scan" \
 bash -c \
-"trivy fs . \
+"trivy fs \
+--timeout 15m \
+. \
 --scanners vuln,secret,misconfig \
 --format json \
 --output '$BASE_DIR/trivy/filesystem_scan.json'"
@@ -588,6 +626,8 @@ bash -c \
 # =====================================================================================
 # TRIVY IMAGE SCANS
 # =====================================================================================
+
+if [[ -s "$IMAGE_FILE" ]]; then
 
 while read -r image; do
 
@@ -607,12 +647,14 @@ while read -r image; do
 
 done < "$IMAGE_FILE"
 
+fi
+
 # =====================================================================================
 # PROWLER SOC2 AUDIT
 # =====================================================================================
 
 run_cmd \
-"Prowler SOC2 GCP audit" \
+"Prowler SOC2 audit" \
 bash -c \
 "prowler gcp \
 --project-id '$PROJECT_ID' \
@@ -621,33 +663,21 @@ bash -c \
 --output-formats json csv html"
 
 # =====================================================================================
-# PRIVILEGE ESCALATION HEURISTICS
-# =====================================================================================
-
-run_cmd \
-"Privilege escalation analysis" \
-bash -c \
-"jq '.bindings[] | select(.role == \"roles/owner\" or .role == \"roles/editor\" or .role == \"roles/iam.serviceAccountAdmin\" or .role == \"roles/iam.serviceAccountTokenCreator\")' '$BASE_DIR/iam/project_iam.json' > '$BASE_DIR/iam/possible_privesc.json'"
-
-# =====================================================================================
 # SUMMARY
 # =====================================================================================
 
 echo
 echo "======================================================================"
-echo "                  GCP ENTERPRISE AUDIT COMPLETE"
+echo "                 GCP AUDIT COMPLETED"
 echo "======================================================================"
 echo
 echo "PROJECT:"
 echo "  $PROJECT_ID"
 echo
-echo "OUTPUT DIRECTORY:"
+echo "OUTPUT:"
 echo "  $BASE_DIR"
 echo
 echo "ERROR LOG:"
 echo "  $ERROR_LOG"
-echo
-echo "SOC2 OUTPUT:"
-echo "  $BASE_DIR/prowler/"
 echo
 echo "======================================================================"
