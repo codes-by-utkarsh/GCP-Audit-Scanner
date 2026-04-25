@@ -1,7 +1,27 @@
 #!/usr/bin/env bash
 
 # =====================================================================================
-# ENTERPRISE GCP SECURITY AUDIT FRAMEWORK (SOC2 ALIGNED - HARDENED EDITION)
+# HARDENED ENTERPRISE GCP SECURITY AUDIT FRAMEWORK (SOC2 ALIGNED)
+# =====================================================================================
+#
+# HARDENING FEATURES
+# ------------------
+# [x] Never exits on single failure
+# [x] Retries transient failures
+# [x] Timeout protection
+# [x] Safe JSON parsing
+# [x] Dynamic cluster handling
+# [x] Dynamic Cloud Run region handling
+# [x] Safe filename sanitization
+# [x] Kubernetes multi-cluster Trivy scans
+# [x] Artifact Registry safe enumeration
+# [x] SOC2 mapped Prowler findings
+# [x] Non-interactive installations
+# [x] Error logging
+# [x] Command logging
+# [x] Graceful API failures
+# [x] Large environment resilience
+#
 # =====================================================================================
 
 set +e
@@ -9,8 +29,6 @@ set +u
 set +o pipefail
 
 export DEBIAN_FRONTEND=noninteractive
-
-trap 'echo "[!] Non-fatal error occurred, continuing..."' ERR
 
 PROJECT_ID="${1:-}"
 
@@ -20,7 +38,6 @@ if [[ -z "$PROJECT_ID" ]]; then
 fi
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-
 BASE_DIR="gcp_audit_${PROJECT_ID}_${TIMESTAMP}"
 
 mkdir -p "$BASE_DIR"/{
@@ -41,21 +58,54 @@ mkdir -p "$BASE_DIR"/{
 }
 
 ERROR_LOG="$BASE_DIR/logs/errors.log"
+COMMAND_LOG="$BASE_DIR/logs/commands.log"
 
-touch "$ERROR_LOG"
+touch "$ERROR_LOG" "$COMMAND_LOG"
 
 # =====================================================================================
 # LOGGING
 # =====================================================================================
 
 log() {
-
     echo
     echo "================================================================"
     echo "[+] $1"
     echo "================================================================"
     echo
+}
 
+# =====================================================================================
+# SANITIZATION
+# =====================================================================================
+
+safe_name() {
+    echo "$1" | tr -cd '[:alnum:]_.-' | tr '/:@' '_'
+}
+
+# =====================================================================================
+# RETRY WRAPPER
+# =====================================================================================
+
+retry_cmd() {
+
+    local retries=3
+    local delay=5
+
+    for ((i=1; i<=retries; i++)); do
+
+        "$@"
+
+        EXIT_CODE=$?
+
+        if [[ $EXIT_CODE -eq 0 ]]; then
+            return 0
+        fi
+
+        sleep "$delay"
+
+    done
+
+    return $EXIT_CODE
 }
 
 # =====================================================================================
@@ -69,16 +119,14 @@ timeout_cmd() {
     EXIT_CODE=$?
 
     if [[ $EXIT_CODE -eq 124 ]]; then
-
         echo "$(date) | TIMEOUT | $*" >> "$ERROR_LOG"
-
     fi
 
-    return 0
+    return $EXIT_CODE
 }
 
 # =====================================================================================
-# SAFE EXECUTION
+# SAFE EXECUTION WRAPPER
 # =====================================================================================
 
 run_cmd() {
@@ -86,12 +134,14 @@ run_cmd() {
     DESC="$1"
     shift
 
+    echo "$(date) | $DESC | $*" >> "$COMMAND_LOG"
+
     echo
     echo "[+] $DESC"
     echo "[*] Running: $*"
     echo
 
-    timeout_cmd "$@"
+    retry_cmd timeout_cmd "$@"
 
     EXIT_CODE=$?
 
@@ -136,7 +186,8 @@ apt-transport-https \
 ca-certificates \
 gnupg \
 lsb-release \
-coreutils
+coreutils \
+kubectl
 
 # =====================================================================================
 # INSTALL GCLOUD
@@ -150,18 +201,6 @@ if ! command -v gcloud >/dev/null 2>&1; then
     "curl -s https://sdk.cloud.google.com | bash"
 
     export PATH="$PATH:$HOME/google-cloud-sdk/bin"
-
-fi
-
-# =====================================================================================
-# INSTALL KUBECTL
-# =====================================================================================
-
-if ! command -v kubectl >/dev/null 2>&1; then
-
-    run_cmd \
-    "Install kubectl" \
-    gcloud components install kubectl --quiet
 
 fi
 
@@ -195,8 +234,10 @@ if ! command -v trivy >/dev/null 2>&1; then
 fi
 
 # =====================================================================================
-# AUTHENTICATION
+# AUTHENTICATION VALIDATION
 # =====================================================================================
+
+log "Checking authentication"
 
 ACTIVE_ACCOUNT=$(gcloud auth list \
 --filter=status:ACTIVE \
@@ -213,6 +254,10 @@ if [[ -z "$ACTIVE_ACCOUNT" ]]; then
     gcloud auth application-default login --no-launch-browser
 
 fi
+
+run_cmd \
+"Validate credentials" \
+gcloud auth print-access-token
 
 # =====================================================================================
 # SET PROJECT
@@ -254,12 +299,12 @@ if [[ -s "$BASE_DIR/iam/project_iam.json" ]]; then
 run_cmd \
 "High privilege role detection" \
 bash -c \
-"jq '.bindings[] | select(.role | test(\"owner|editor|admin|iam|security|resourcemanager\"; \"i\"))' '$BASE_DIR/iam/project_iam.json' > '$BASE_DIR/iam/high_priv_roles.json'"
+"jq '.bindings[]? | select(.role | test(\"owner|editor|admin|iam|security|resourcemanager\"; \"i\"))' '$BASE_DIR/iam/project_iam.json' > '$BASE_DIR/iam/high_priv_roles.json'"
 
 run_cmd \
 "Public IAM exposure detection" \
 bash -c \
-"jq '.bindings[] | select((.members[]? | contains(\"allUsers\")) or (.members[]? | contains(\"allAuthenticatedUsers\")))' '$BASE_DIR/iam/project_iam.json' > '$BASE_DIR/iam/public_bindings.json'"
+"jq '.bindings[]? | select((.members[]? | contains(\"allUsers\")) or (.members[]? | contains(\"allAuthenticatedUsers\")))' '$BASE_DIR/iam/project_iam.json' > '$BASE_DIR/iam/public_bindings.json'"
 
 fi
 
@@ -274,36 +319,29 @@ bash -c \
 
 if [[ -s "$BASE_DIR/iam/service_accounts.json" ]]; then
 
-while read -r sa; do
+jq -r '.[].email // empty' \
+"$BASE_DIR/iam/service_accounts.json" 2>/dev/null | while read -r sa; do
 
     [[ -z "$sa" ]] && continue
 
-    SAFE_NAME=$(echo "$sa" | tr '@.' '_')
+    SAFE_NAME=$(safe_name "$sa")
 
     run_cmd \
     "Service account key enumeration: $sa" \
     bash -c \
-    "gcloud iam service-accounts keys list \
-    --iam-account '$sa' \
-    --format=json \
-    > '$BASE_DIR/iam/${SAFE_NAME}_keys.json'"
+    "gcloud iam service-accounts keys list --iam-account '$sa' --format=json > '$BASE_DIR/iam/${SAFE_NAME}_keys.json'"
 
     run_cmd \
     "Workload identity extraction: $sa" \
     bash -c \
-    "gcloud iam service-accounts get-iam-policy '$sa' \
-    --format=json \
-    > '$BASE_DIR/iam/workload_identity_${SAFE_NAME}.json'"
+    "gcloud iam service-accounts get-iam-policy '$sa' --format=json > '$BASE_DIR/iam/workload_identity_${SAFE_NAME}.json'"
 
-done < <(
-    jq -r '.[].email' \
-    "$BASE_DIR/iam/service_accounts.json" 2>/dev/null
-)
+done
 
 fi
 
 # =====================================================================================
-# COMPUTE INSTANCES
+# COMPUTE
 # =====================================================================================
 
 run_cmd \
@@ -316,23 +354,28 @@ if [[ -s "$BASE_DIR/compute/instances.json" ]]; then
 run_cmd \
 "External IP analysis" \
 bash -c \
-"jq '[ .[] | {name: .name, externalIPs: [ .networkInterfaces[]?.accessConfigs[]?.natIP ]}]' '$BASE_DIR/compute/instances.json' > '$BASE_DIR/exposure/external_ips.json'"
+"jq '[ .[]? | {name: .name, externalIPs: [ .networkInterfaces[]?.accessConfigs[]?.natIP ]}]' '$BASE_DIR/compute/instances.json' > '$BASE_DIR/exposure/external_ips.json'"
 
 run_cmd \
 "OAuth scope extraction" \
 bash -c \
-"jq '[ .[] | {instance: .name, scopes: [ .serviceAccounts[]?.scopes[] ]}]' '$BASE_DIR/compute/instances.json' > '$BASE_DIR/oauth/oauth_scopes.json'"
+"jq '[ .[]? | {instance: .name, scopes: [ .serviceAccounts[]?.scopes[] ]}]' '$BASE_DIR/compute/instances.json' > '$BASE_DIR/oauth/oauth_scopes.json'"
 
 fi
 
 # =====================================================================================
-# FIREWALL RULES
+# NETWORKING
 # =====================================================================================
 
 run_cmd \
 "Firewall enumeration" \
 bash -c \
 "gcloud compute firewall-rules list --format=json > '$BASE_DIR/networking/firewall_rules.json'"
+
+run_cmd \
+"VPC enumeration" \
+bash -c \
+"gcloud compute networks list --format=json > '$BASE_DIR/networking/networks.json'"
 
 # =====================================================================================
 # STORAGE
@@ -341,32 +384,28 @@ bash -c \
 run_cmd \
 "Bucket enumeration" \
 bash -c \
-"gcloud storage buckets list --format=json > '$BASE_DIR/storage/buckets.json'"
+"gcloud storage buckets list --format=json > '$BASE_DIR/storage/buckets.json' || gsutil ls > '$BASE_DIR/storage/buckets_fallback.txt'"
 
 if [[ -s "$BASE_DIR/storage/buckets.json" ]]; then
 
-while read -r bucket; do
+jq -r '.[].name // empty' \
+"$BASE_DIR/storage/buckets.json" 2>/dev/null | while read -r bucket; do
 
     [[ -z "$bucket" ]] && continue
 
-    SAFE_NAME=$(echo "$bucket" | tr '/:' '_')
+    SAFE_NAME=$(safe_name "$bucket")
 
     run_cmd \
     "Bucket IAM extraction: $bucket" \
     bash -c \
-    "gcloud storage buckets get-iam-policy '$bucket' \
-    --format=json \
-    > '$BASE_DIR/storage/${SAFE_NAME}_iam.json'"
+    "gcloud storage buckets get-iam-policy '$bucket' --format=json > '$BASE_DIR/storage/${SAFE_NAME}_iam.json'"
 
-done < <(
-    jq -r '.[].name' \
-    "$BASE_DIR/storage/buckets.json" 2>/dev/null
-)
+done
 
 fi
 
 # =====================================================================================
-# GKE CLUSTERS
+# GKE ENUMERATION
 # =====================================================================================
 
 run_cmd \
@@ -382,56 +421,43 @@ if [[ -s "$BASE_DIR/kubernetes/clusters.json" ]]; then
 
 mkdir -p "$BASE_DIR/trivy/k8s"
 
-while read -r cluster; do
+jq -c '.[]' "$BASE_DIR/kubernetes/clusters.json" 2>/dev/null | while read -r cluster_json; do
+
+    cluster=$(echo "$cluster_json" | jq -r '.name // empty')
+    location=$(echo "$cluster_json" | jq -r '.location // empty')
 
     [[ -z "$cluster" ]] && continue
+    [[ -z "$location" ]] && continue
 
-    LOCATION=$(gcloud container clusters list \
-    --filter="name=$cluster" \
-    --format="value(location)" \
-    2>/dev/null | head -n1)
-
-    [[ -z "$LOCATION" ]] && continue
+    SAFE_CLUSTER=$(safe_name "$cluster")
 
     run_cmd \
     "Fetch credentials for $cluster" \
     gcloud container clusters get-credentials \
     "$cluster" \
-    --location "$LOCATION"
+    --location "$location"
 
     run_cmd \
     "ClusterRoleBindings extraction: $cluster" \
     bash -c \
-    "kubectl --request-timeout=30s get clusterrolebindings -o yaml > '$BASE_DIR/kubernetes/${cluster}_clusterrolebindings.yaml'"
+    "kubectl --request-timeout=30s get clusterrolebindings -o yaml > '$BASE_DIR/kubernetes/${SAFE_CLUSTER}_clusterrolebindings.yaml'"
 
     run_cmd \
     "RBAC extraction: $cluster" \
     bash -c \
-    "kubectl --request-timeout=30s get roles,rolebindings -A -o yaml > '$BASE_DIR/kubernetes/${cluster}_rbac.yaml'"
+    "kubectl --request-timeout=30s get roles,rolebindings -A -o yaml > '$BASE_DIR/kubernetes/${SAFE_CLUSTER}_rbac.yaml'"
 
     run_cmd \
     "Trivy Kubernetes summary scan: $cluster" \
     bash -c \
-    "trivy k8s \
-    --report summary \
-    --timeout 15m \
-    cluster \
-    > '$BASE_DIR/trivy/k8s/${cluster}_summary.txt'"
+    "trivy k8s cluster --report summary --timeout 15m > '$BASE_DIR/trivy/k8s/${SAFE_CLUSTER}_summary.txt'"
 
     run_cmd \
     "Trivy Kubernetes JSON scan: $cluster" \
     bash -c \
-    "trivy k8s \
-    --report all \
-    --format json \
-    --timeout 15m \
-    cluster \
-    > '$BASE_DIR/trivy/k8s/${cluster}_full.json'"
+    "trivy k8s cluster --report all --format json --timeout 15m > '$BASE_DIR/trivy/k8s/${SAFE_CLUSTER}_full.json'"
 
-done < <(
-    jq -r '.[].name' \
-    "$BASE_DIR/kubernetes/clusters.json" 2>/dev/null
-)
+done
 
 fi
 
@@ -440,9 +466,14 @@ fi
 # =====================================================================================
 
 run_cmd \
-"Cloud Functions enumeration" \
+"Cloud Functions Gen1 enumeration" \
 bash -c \
-"gcloud functions list --format=json > '$BASE_DIR/cloudfunctions/functions.json'"
+"gcloud functions list --format=json > '$BASE_DIR/cloudfunctions/functions_gen1.json'"
+
+run_cmd \
+"Cloud Functions Gen2 enumeration" \
+bash -c \
+"gcloud functions list --gen2 --format=json > '$BASE_DIR/cloudfunctions/functions_gen2.json'"
 
 # =====================================================================================
 # CLOUD RUN
@@ -451,10 +482,7 @@ bash -c \
 run_cmd \
 "Cloud Run enumeration" \
 bash -c \
-"gcloud run services list \
---platform managed \
---format='csv[no-heading](name,region)' \
-> '$BASE_DIR/cloudrun/services_with_regions.txt'"
+"gcloud run services list --platform managed --format='csv[no-heading](name,region)' > '$BASE_DIR/cloudrun/services_with_regions.txt'"
 
 if [[ -s "$BASE_DIR/cloudrun/services_with_regions.txt" ]]; then
 
@@ -463,15 +491,12 @@ while IFS=',' read -r service region; do
     [[ -z "$service" ]] && continue
     [[ -z "$region" ]] && continue
 
-    SAFE_NAME=$(echo "$service" | tr '/:' '_')
+    SAFE_NAME=$(safe_name "$service")
 
     run_cmd \
     "Cloud Run IAM extraction: $service ($region)" \
     bash -c \
-    "gcloud run services get-iam-policy '$service' \
-    --region '$region' \
-    --format=json \
-    > '$BASE_DIR/cloudrun/${SAFE_NAME}_policy.json'"
+    "gcloud run services get-iam-policy '$service' --region '$region' --format=json > '$BASE_DIR/cloudrun/${SAFE_NAME}_policy.json'"
 
 done < "$BASE_DIR/cloudrun/services_with_regions.txt"
 
@@ -488,23 +513,19 @@ bash -c \
 
 if [[ -s "$BASE_DIR/secrets/secrets.json" ]]; then
 
-while read -r secret; do
+jq -r '.[].name // empty' \
+"$BASE_DIR/secrets/secrets.json" 2>/dev/null | while read -r secret; do
 
     [[ -z "$secret" ]] && continue
 
-    SAFE_NAME=$(basename "$secret")
+    SAFE_NAME=$(safe_name "$(basename "$secret")")
 
     run_cmd \
     "Secret IAM extraction: $SAFE_NAME" \
     bash -c \
-    "gcloud secrets get-iam-policy '$SAFE_NAME' \
-    --format=json \
-    > '$BASE_DIR/secrets/${SAFE_NAME}_iam.json'"
+    "gcloud secrets get-iam-policy '$SAFE_NAME' --format=json > '$BASE_DIR/secrets/${SAFE_NAME}_iam.json'"
 
-done < <(
-    jq -r '.[].name' \
-    "$BASE_DIR/secrets/secrets.json" 2>/dev/null
-)
+done
 
 fi
 
@@ -523,7 +544,11 @@ bash -c \
 
 if [[ -s "$BASE_DIR/artifacts/repositories.json" ]]; then
 
-while read -r repo format location; do
+jq -c '.[]' "$BASE_DIR/artifacts/repositories.json" 2>/dev/null | while read -r repo_json; do
+
+    repo=$(echo "$repo_json" | jq -r '.name // empty')
+    format=$(echo "$repo_json" | jq -r '.format // empty')
+    location=$(echo "$repo_json" | jq -r '.location // empty')
 
     [[ -z "$repo" ]] && continue
 
@@ -531,27 +556,14 @@ while read -r repo format location; do
         continue
     fi
 
+    REPO_NAME=$(basename "$repo")
+
     run_cmd \
     "Artifact image enumeration: $repo" \
     bash -c \
-    "gcloud artifacts docker images list '$repo' \
-    --include-tags \
-    --format='value(package)' \
-    >> '$IMAGE_FILE'"
+    "gcloud artifacts docker images list '${location}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}' --include-tags --format='value(package)' >> '$IMAGE_FILE'"
 
-done < <(
-
-    jq -r '
-    .[]
-    | [
-        .name,
-        .format,
-        .location
-      ]
-    | @tsv
-    ' "$BASE_DIR/artifacts/repositories.json" 2>/dev/null
-
-)
+done
 
 fi
 
@@ -561,15 +573,12 @@ sort -u "$IMAGE_FILE" -o "$IMAGE_FILE"
 # TRIVY FILESYSTEM SCAN
 # =====================================================================================
 
+SCAN_PATH="${SCAN_PATH:-.}"
+
 run_cmd \
 "Trivy filesystem scan" \
 bash -c \
-"trivy fs \
---timeout 15m \
-. \
---scanners vuln,secret,misconfig \
---format json \
---output '$BASE_DIR/trivy/filesystem_scan.json'"
+"trivy fs --timeout 15m '$SCAN_PATH' --scanners vuln,secret,misconfig --format json --output '$BASE_DIR/trivy/filesystem_scan.json'"
 
 # =====================================================================================
 # TRIVY IMAGE SCANS
@@ -581,17 +590,12 @@ while read -r image; do
 
     [[ -z "$image" ]] && continue
 
-    SAFE_NAME=$(echo "$image" | tr '/:' '_')
+    SAFE_NAME=$(safe_name "$image")
 
     run_cmd \
     "Trivy image scan: $image" \
     bash -c \
-    "trivy image \
-    --timeout 15m \
-    --scanners vuln,secret,misconfig \
-    --format json \
-    --output '$BASE_DIR/trivy/images_${SAFE_NAME}.json' \
-    '$image'"
+    "trivy image --timeout 15m --scanners vuln,secret,misconfig --format json --output '$BASE_DIR/trivy/images_${SAFE_NAME}.json' '$image'"
 
 done < "$IMAGE_FILE"
 
@@ -605,10 +609,10 @@ run_cmd \
 "Prowler SOC2 audit" \
 bash -c \
 "prowler gcp \
---project-id '$PROJECT_ID' \
+--project-ids '$PROJECT_ID' \
 --compliance soc2_gcp \
 --output-directory '$BASE_DIR/prowler' \
---output-formats json csv html"
+-M json csv html"
 
 # =====================================================================================
 # SUMMARY
@@ -627,5 +631,8 @@ echo "  $BASE_DIR"
 echo
 echo "ERROR LOG:"
 echo "  $ERROR_LOG"
+echo
+echo "COMMAND LOG:"
+echo "  $COMMAND_LOG"
 echo
 echo "======================================================================"
