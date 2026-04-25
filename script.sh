@@ -3,31 +3,6 @@
 # =====================================================================================
 # ENTERPRISE GCP SECURITY AUDIT FRAMEWORK (SOC2 ALIGNED - HARDENED EDITION)
 # =====================================================================================
-#
-# FEATURES
-# --------
-# [x] Failure-resistant execution
-# [x] Timeout protection
-# [x] Non-interactive installs
-# [x] Error logging
-# [x] SOC2 compliance mapping
-# [x] IAM auditing
-# [x] Service account analysis
-# [x] Workload identity analysis
-# [x] OAuth scope extraction
-# [x] External exposure analysis
-# [x] Firewall enumeration
-# [x] Bucket IAM analysis
-# [x] GKE RBAC extraction
-# [x] Cloud Run IAM extraction
-# [x] Secret Manager IAM extraction
-# [x] Artifact Registry enumeration
-# [x] Trivy filesystem scans
-# [x] Trivy image scans
-# [x] Trivy Kubernetes scans
-# [x] Prowler SOC2 audit
-#
-# =====================================================================================
 
 set +e
 set +u
@@ -391,7 +366,7 @@ done < <(
 fi
 
 # =====================================================================================
-# GKE
+# GKE CLUSTERS
 # =====================================================================================
 
 run_cmd \
@@ -399,7 +374,13 @@ run_cmd \
 bash -c \
 "gcloud container clusters list --format=json > '$BASE_DIR/kubernetes/clusters.json'"
 
+# =====================================================================================
+# GKE RBAC & TRIVY KUBERNETES SCAN
+# =====================================================================================
+
 if [[ -s "$BASE_DIR/kubernetes/clusters.json" ]]; then
+
+mkdir -p "$BASE_DIR/trivy/k8s"
 
 while read -r cluster; do
 
@@ -427,6 +408,25 @@ while read -r cluster; do
     "RBAC extraction: $cluster" \
     bash -c \
     "kubectl --request-timeout=30s get roles,rolebindings -A -o yaml > '$BASE_DIR/kubernetes/${cluster}_rbac.yaml'"
+
+    run_cmd \
+    "Trivy Kubernetes summary scan: $cluster" \
+    bash -c \
+    "trivy k8s \
+    --report summary \
+    --timeout 15m \
+    cluster \
+    > '$BASE_DIR/trivy/k8s/${cluster}_summary.txt'"
+
+    run_cmd \
+    "Trivy Kubernetes JSON scan: $cluster" \
+    bash -c \
+    "trivy k8s \
+    --report all \
+    --format json \
+    --timeout 15m \
+    cluster \
+    > '$BASE_DIR/trivy/k8s/${cluster}_full.json'"
 
 done < <(
     jq -r '.[].name' \
@@ -596,31 +596,6 @@ while read -r image; do
 done < "$IMAGE_FILE"
 
 fi
-
-# =====================================================================================
-# TRIVY KUBERNETES SCAN
-# =====================================================================================
-
-mkdir -p "$BASE_DIR/trivy/k8s"
-
-run_cmd \
-"Trivy Kubernetes summary scan" \
-bash -c \
-"trivy k8s \
---report summary \
---timeout 15m \
-cluster \
-> '$BASE_DIR/trivy/k8s/k8s_summary.txt'"
-
-run_cmd \
-"Trivy Kubernetes JSON scan" \
-bash -c \
-"trivy k8s \
---report all \
---format json \
---timeout 15m \
-cluster \
-> '$BASE_DIR/trivy/k8s/k8s_full.json'"
 
 # =====================================================================================
 # PROWLER SOC2 AUDIT
