@@ -3,26 +3,6 @@
 # =====================================================================================
 # HARDENED ENTERPRISE GCP SECURITY AUDIT FRAMEWORK (SOC2 ALIGNED)
 # =====================================================================================
-#
-# HARDENING FEATURES
-# ------------------
-# [x] Never exits on single failure
-# [x] Retries transient failures
-# [x] Timeout protection
-# [x] Safe JSON parsing
-# [x] Dynamic cluster handling
-# [x] Dynamic Cloud Run region handling
-# [x] Safe filename sanitization
-# [x] Kubernetes multi-cluster Trivy scans
-# [x] Artifact Registry safe enumeration
-# [x] SOC2 mapped Prowler findings
-# [x] Non-interactive installations
-# [x] Error logging
-# [x] Command logging
-# [x] Graceful API failures
-# [x] Large environment resilience
-#
-# =====================================================================================
 
 set +e
 set +u
@@ -40,38 +20,45 @@ fi
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 BASE_DIR="gcp_audit_${PROJECT_ID}_${TIMESTAMP}"
 
-mkdir -p "$BASE_DIR"/{
-    iam,
-    compute,
-    networking,
-    storage,
-    kubernetes,
-    cloudrun,
-    cloudfunctions,
-    secrets,
-    artifacts,
-    oauth,
-    exposure,
-    prowler,
-    trivy,
-    logs
-}
+# =====================================================================================
+# SAFE DIRECTORY CREATION
+# =====================================================================================
+
+mkdir -p \
+"$BASE_DIR/iam" \
+"$BASE_DIR/compute" \
+"$BASE_DIR/networking" \
+"$BASE_DIR/storage" \
+"$BASE_DIR/kubernetes" \
+"$BASE_DIR/cloudrun" \
+"$BASE_DIR/cloudfunctions" \
+"$BASE_DIR/secrets" \
+"$BASE_DIR/artifacts" \
+"$BASE_DIR/oauth" \
+"$BASE_DIR/exposure" \
+"$BASE_DIR/prowler" \
+"$BASE_DIR/trivy" \
+"$BASE_DIR/trivy/k8s" \
+"$BASE_DIR/logs"
 
 ERROR_LOG="$BASE_DIR/logs/errors.log"
 COMMAND_LOG="$BASE_DIR/logs/commands.log"
 
-touch "$ERROR_LOG" "$COMMAND_LOG"
+touch "$ERROR_LOG"
+touch "$COMMAND_LOG"
 
 # =====================================================================================
 # LOGGING
 # =====================================================================================
 
 log() {
+
     echo
     echo "================================================================"
     echo "[+] $1"
     echo "================================================================"
     echo
+
 }
 
 # =====================================================================================
@@ -79,7 +66,9 @@ log() {
 # =====================================================================================
 
 safe_name() {
-    echo "$1" | tr -cd '[:alnum:]_.-' | tr '/:@' '_'
+
+    echo "$1" | tr '/:@ ' '_' | tr -cd '[:alnum:]_.-'
+
 }
 
 # =====================================================================================
@@ -106,6 +95,7 @@ retry_cmd() {
     done
 
     return $EXIT_CODE
+
 }
 
 # =====================================================================================
@@ -119,14 +109,17 @@ timeout_cmd() {
     EXIT_CODE=$?
 
     if [[ $EXIT_CODE -eq 124 ]]; then
+
         echo "$(date) | TIMEOUT | $*" >> "$ERROR_LOG"
+
     fi
 
     return $EXIT_CODE
+
 }
 
 # =====================================================================================
-# SAFE EXECUTION WRAPPER
+# SAFE EXECUTION
 # =====================================================================================
 
 run_cmd() {
@@ -160,6 +153,7 @@ run_cmd() {
     fi
 
     return 0
+
 }
 
 # =====================================================================================
@@ -190,7 +184,7 @@ coreutils \
 kubectl
 
 # =====================================================================================
-# INSTALL GCLOUD
+# INSTALL GCLOUD SDK
 # =====================================================================================
 
 if ! command -v gcloud >/dev/null 2>&1; then
@@ -234,7 +228,7 @@ if ! command -v trivy >/dev/null 2>&1; then
 fi
 
 # =====================================================================================
-# AUTHENTICATION VALIDATION
+# AUTHENTICATION
 # =====================================================================================
 
 log "Checking authentication"
@@ -329,12 +323,17 @@ jq -r '.[].email // empty' \
     run_cmd \
     "Service account key enumeration: $sa" \
     bash -c \
-    "gcloud iam service-accounts keys list --iam-account '$sa' --format=json > '$BASE_DIR/iam/${SAFE_NAME}_keys.json'"
+    "gcloud iam service-accounts keys list \
+    --iam-account '$sa' \
+    --format=json \
+    > '$BASE_DIR/iam/${SAFE_NAME}_keys.json'"
 
     run_cmd \
     "Workload identity extraction: $sa" \
     bash -c \
-    "gcloud iam service-accounts get-iam-policy '$sa' --format=json > '$BASE_DIR/iam/workload_identity_${SAFE_NAME}.json'"
+    "gcloud iam service-accounts get-iam-policy '$sa' \
+    --format=json \
+    > '$BASE_DIR/iam/workload_identity_${SAFE_NAME}.json'"
 
 done
 
@@ -384,7 +383,7 @@ bash -c \
 run_cmd \
 "Bucket enumeration" \
 bash -c \
-"gcloud storage buckets list --format=json > '$BASE_DIR/storage/buckets.json' || gsutil ls > '$BASE_DIR/storage/buckets_fallback.txt'"
+"gcloud storage buckets list --format=json > '$BASE_DIR/storage/buckets.json'"
 
 if [[ -s "$BASE_DIR/storage/buckets.json" ]]; then
 
@@ -398,7 +397,9 @@ jq -r '.[].name // empty' \
     run_cmd \
     "Bucket IAM extraction: $bucket" \
     bash -c \
-    "gcloud storage buckets get-iam-policy '$bucket' --format=json > '$BASE_DIR/storage/${SAFE_NAME}_iam.json'"
+    "gcloud storage buckets get-iam-policy '$bucket' \
+    --format=json \
+    > '$BASE_DIR/storage/${SAFE_NAME}_iam.json'"
 
 done
 
@@ -414,12 +415,10 @@ bash -c \
 "gcloud container clusters list --format=json > '$BASE_DIR/kubernetes/clusters.json'"
 
 # =====================================================================================
-# GKE RBAC & TRIVY KUBERNETES SCAN
+# GKE RBAC + TRIVY SCANS
 # =====================================================================================
 
 if [[ -s "$BASE_DIR/kubernetes/clusters.json" ]]; then
-
-mkdir -p "$BASE_DIR/trivy/k8s"
 
 jq -c '.[]' "$BASE_DIR/kubernetes/clusters.json" 2>/dev/null | while read -r cluster_json; do
 
@@ -450,12 +449,19 @@ jq -c '.[]' "$BASE_DIR/kubernetes/clusters.json" 2>/dev/null | while read -r clu
     run_cmd \
     "Trivy Kubernetes summary scan: $cluster" \
     bash -c \
-    "trivy k8s cluster --report summary --timeout 15m > '$BASE_DIR/trivy/k8s/${SAFE_CLUSTER}_summary.txt'"
+    "trivy k8s cluster \
+    --report summary \
+    --timeout 15m \
+    > '$BASE_DIR/trivy/k8s/${SAFE_CLUSTER}_summary.txt'"
 
     run_cmd \
     "Trivy Kubernetes JSON scan: $cluster" \
     bash -c \
-    "trivy k8s cluster --report all --format json --timeout 15m > '$BASE_DIR/trivy/k8s/${SAFE_CLUSTER}_full.json'"
+    "trivy k8s cluster \
+    --report all \
+    --format json \
+    --timeout 15m \
+    > '$BASE_DIR/trivy/k8s/${SAFE_CLUSTER}_full.json'"
 
 done
 
@@ -482,7 +488,10 @@ bash -c \
 run_cmd \
 "Cloud Run enumeration" \
 bash -c \
-"gcloud run services list --platform managed --format='csv[no-heading](name,region)' > '$BASE_DIR/cloudrun/services_with_regions.txt'"
+"gcloud run services list \
+--platform managed \
+--format='csv[no-heading](name,region)' \
+> '$BASE_DIR/cloudrun/services_with_regions.txt'"
 
 if [[ -s "$BASE_DIR/cloudrun/services_with_regions.txt" ]]; then
 
@@ -496,7 +505,10 @@ while IFS=',' read -r service region; do
     run_cmd \
     "Cloud Run IAM extraction: $service ($region)" \
     bash -c \
-    "gcloud run services get-iam-policy '$service' --region '$region' --format=json > '$BASE_DIR/cloudrun/${SAFE_NAME}_policy.json'"
+    "gcloud run services get-iam-policy '$service' \
+    --region '$region' \
+    --format=json \
+    > '$BASE_DIR/cloudrun/${SAFE_NAME}_policy.json'"
 
 done < "$BASE_DIR/cloudrun/services_with_regions.txt"
 
@@ -518,12 +530,15 @@ jq -r '.[].name // empty' \
 
     [[ -z "$secret" ]] && continue
 
-    SAFE_NAME=$(safe_name "$(basename "$secret")")
+    SECRET_NAME=$(basename "$secret")
+    SAFE_NAME=$(safe_name "$SECRET_NAME")
 
     run_cmd \
-    "Secret IAM extraction: $SAFE_NAME" \
+    "Secret IAM extraction: $SECRET_NAME" \
     bash -c \
-    "gcloud secrets get-iam-policy '$SAFE_NAME' --format=json > '$BASE_DIR/secrets/${SAFE_NAME}_iam.json'"
+    "gcloud secrets get-iam-policy '$SECRET_NAME' \
+    --format=json \
+    > '$BASE_DIR/secrets/${SAFE_NAME}_iam.json'"
 
 done
 
@@ -556,12 +571,16 @@ jq -c '.[]' "$BASE_DIR/artifacts/repositories.json" 2>/dev/null | while read -r 
         continue
     fi
 
-    REPO_NAME=$(basename "$repo")
+    repo_name=$(basename "$repo")
 
     run_cmd \
-    "Artifact image enumeration: $repo" \
+    "Artifact image enumeration: $repo_name" \
     bash -c \
-    "gcloud artifacts docker images list '${location}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}' --include-tags --format='value(package)' >> '$IMAGE_FILE'"
+    "gcloud artifacts docker images list \
+    '${location}-docker.pkg.dev/${PROJECT_ID}/${repo_name}' \
+    --include-tags \
+    --format='value(package)' \
+    >> '$IMAGE_FILE'"
 
 done
 
@@ -578,7 +597,12 @@ SCAN_PATH="${SCAN_PATH:-.}"
 run_cmd \
 "Trivy filesystem scan" \
 bash -c \
-"trivy fs --timeout 15m '$SCAN_PATH' --scanners vuln,secret,misconfig --format json --output '$BASE_DIR/trivy/filesystem_scan.json'"
+"trivy fs \
+--timeout 15m \
+'$SCAN_PATH' \
+--scanners vuln,secret,misconfig \
+--format json \
+--output '$BASE_DIR/trivy/filesystem_scan.json'"
 
 # =====================================================================================
 # TRIVY IMAGE SCANS
@@ -595,7 +619,12 @@ while read -r image; do
     run_cmd \
     "Trivy image scan: $image" \
     bash -c \
-    "trivy image --timeout 15m --scanners vuln,secret,misconfig --format json --output '$BASE_DIR/trivy/images_${SAFE_NAME}.json' '$image'"
+    "trivy image \
+    --timeout 15m \
+    --scanners vuln,secret,misconfig \
+    --format json \
+    --output '$BASE_DIR/trivy/images_${SAFE_NAME}.json' \
+    '$image'"
 
 done < "$IMAGE_FILE"
 
