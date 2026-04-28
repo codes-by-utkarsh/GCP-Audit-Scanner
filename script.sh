@@ -2,6 +2,7 @@
 
 # =====================================================================================
 # HARDENED ENTERPRISE GCP SECURITY AUDIT FRAMEWORK (SOC2 ALIGNED)
+# CLOUD SHELL + VM SAFE EDITION
 # =====================================================================================
 
 set +e
@@ -62,7 +63,7 @@ log() {
 }
 
 # =====================================================================================
-# SANITIZATION
+# SAFE NAME
 # =====================================================================================
 
 safe_name() {
@@ -72,7 +73,7 @@ safe_name() {
 }
 
 # =====================================================================================
-# RETRY WRAPPER
+# RETRY
 # =====================================================================================
 
 retry_cmd() {
@@ -99,7 +100,7 @@ retry_cmd() {
 }
 
 # =====================================================================================
-# TIMEOUT WRAPPER
+# TIMEOUT
 # =====================================================================================
 
 timeout_cmd() {
@@ -157,46 +158,52 @@ run_cmd() {
 }
 
 # =====================================================================================
-# INSTALL DEPENDENCIES
+# CLOUD SHELL FIX
 # =====================================================================================
 
-log "Installing dependencies"
-
-run_cmd \
-"APT Update" \
-sudo apt-get update -y
-
-run_cmd \
-"Install dependencies" \
-sudo apt-get install -y \
-curl \
-wget \
-jq \
-unzip \
-python3 \
-python3-pip \
-docker.io \
-apt-transport-https \
-ca-certificates \
-gnupg \
-lsb-release \
-coreutils \
-kubectl
+mkdir -p ~/.cloudshell
+touch ~/.cloudshell/no-apt-get-warning
 
 # =====================================================================================
-# INSTALL GCLOUD SDK
+# INSTALL MISSING DEPENDENCIES ONLY
 # =====================================================================================
 
-if ! command -v gcloud >/dev/null 2>&1; then
+log "Checking dependencies"
+
+if ! command -v jq >/dev/null 2>&1; then
 
     run_cmd \
-    "Install GCloud SDK" \
-    bash -c \
-    "curl -s https://sdk.cloud.google.com | bash"
+    "Install jq" \
+    sudo apt-get update -y
 
-    export PATH="$PATH:$HOME/google-cloud-sdk/bin"
+    run_cmd \
+    "Install jq package" \
+    sudo apt-get install -y jq
 
 fi
+
+# =====================================================================================
+# VERIFY REQUIRED TOOLS
+# =====================================================================================
+
+REQUIRED_TOOLS=(
+    gcloud
+    kubectl
+    python3
+    pip3
+)
+
+for tool in "${REQUIRED_TOOLS[@]}"; do
+
+    if ! command -v "$tool" >/dev/null 2>&1; then
+
+        echo "[!] Missing required dependency: $tool"
+
+        exit 1
+
+    fi
+
+done
 
 # =====================================================================================
 # INSTALL PROWLER
@@ -205,12 +212,8 @@ fi
 if ! command -v prowler >/dev/null 2>&1; then
 
     run_cmd \
-    "Upgrade pip" \
-    python3 -m pip install --upgrade pip
-
-    run_cmd \
     "Install Prowler" \
-    python3 -m pip install prowler
+    pip3 install prowler
 
 fi
 
@@ -223,7 +226,9 @@ if ! command -v trivy >/dev/null 2>&1; then
     run_cmd \
     "Install Trivy" \
     bash -c \
-    "curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin"
+    "curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /tmp/trivy-bin"
+
+    export PATH="/tmp/trivy-bin:$PATH"
 
 fi
 
@@ -262,7 +267,7 @@ run_cmd \
 gcloud config set project "$PROJECT_ID"
 
 # =====================================================================================
-# VERIFY ACCESS
+# VERIFY PROJECT ACCESS
 # =====================================================================================
 
 run_cmd \
@@ -275,7 +280,7 @@ bash -c \
 # =====================================================================================
 
 run_cmd \
-"Enumerate enabled APIs" \
+"Enabled API enumeration" \
 bash -c \
 "gcloud services list --enabled --format=json > '$BASE_DIR/logs/enabled_apis.json'"
 
@@ -340,7 +345,7 @@ done
 fi
 
 # =====================================================================================
-# COMPUTE
+# COMPUTE INSTANCES
 # =====================================================================================
 
 run_cmd \
@@ -351,7 +356,7 @@ bash -c \
 if [[ -s "$BASE_DIR/compute/instances.json" ]]; then
 
 run_cmd \
-"External IP analysis" \
+"External IP extraction" \
 bash -c \
 "jq '[ .[]? | {name: .name, externalIPs: [ .networkInterfaces[]?.accessConfigs[]?.natIP ]}]' '$BASE_DIR/compute/instances.json' > '$BASE_DIR/exposure/external_ips.json'"
 
@@ -363,18 +368,13 @@ bash -c \
 fi
 
 # =====================================================================================
-# NETWORKING
+# FIREWALL RULES
 # =====================================================================================
 
 run_cmd \
 "Firewall enumeration" \
 bash -c \
 "gcloud compute firewall-rules list --format=json > '$BASE_DIR/networking/firewall_rules.json'"
-
-run_cmd \
-"VPC enumeration" \
-bash -c \
-"gcloud compute networks list --format=json > '$BASE_DIR/networking/networks.json'"
 
 # =====================================================================================
 # STORAGE
@@ -415,7 +415,7 @@ bash -c \
 "gcloud container clusters list --format=json > '$BASE_DIR/kubernetes/clusters.json'"
 
 # =====================================================================================
-# GKE RBAC + TRIVY SCANS
+# GKE RBAC + TRIVY K8S
 # =====================================================================================
 
 if [[ -s "$BASE_DIR/kubernetes/clusters.json" ]]; then
@@ -563,7 +563,6 @@ jq -c '.[]' "$BASE_DIR/artifacts/repositories.json" 2>/dev/null | while read -r 
 
     repo=$(echo "$repo_json" | jq -r '.name // empty')
     format=$(echo "$repo_json" | jq -r '.format // empty')
-    location=$(echo "$repo_json" | jq -r '.location // empty')
 
     [[ -z "$repo" ]] && continue
 
@@ -571,13 +570,10 @@ jq -c '.[]' "$BASE_DIR/artifacts/repositories.json" 2>/dev/null | while read -r 
         continue
     fi
 
-    repo_name=$(basename "$repo")
-
     run_cmd \
-    "Artifact image enumeration: $repo_name" \
+    "Artifact image enumeration: $repo" \
     bash -c \
-    "gcloud artifacts docker images list \
-    '${location}-docker.pkg.dev/${PROJECT_ID}/${repo_name}' \
+    "gcloud artifacts docker images list '$repo' \
     --include-tags \
     --format='value(package)' \
     >> '$IMAGE_FILE'"
